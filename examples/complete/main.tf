@@ -10,7 +10,7 @@ data "aws_availability_zones" "available" {
 }
 
 locals {
-  region = "eu-west-1"
+  region = "us-east-1"
   name   = "ex-${basename(path.cwd)}"
 
   vpc_cidr = "10.0.0.0/16"
@@ -65,6 +65,15 @@ module "ecs" {
     ecsdemo-frontend = {
       cpu    = 1024
       memory = 4096
+
+      # Use EC2 capacity provider (ASG) instead of default Fargate
+      capacity_provider_strategy = {
+        ASG = {
+          base              = 1
+          capacity_provider = "ASG"
+          weight            = 100
+        }
+      }
 
       autoscaling_policies = {
         predictive = {
@@ -148,14 +157,6 @@ module "ecs" {
             }
           ]
 
-          capacity_provider_strategy = {
-            ASG = {
-              base              = 20
-              capacity_provider = "ASG"
-              weight            = 50
-            }
-          }
-
           # Example image used requires access to write to root filesystem
           readonlyRootFilesystem = false
 
@@ -222,6 +223,14 @@ module "ecs" {
           target_group_arn = module.alb.target_groups["ex_ecs"].arn
           container_name   = local.container_name
           container_port   = local.container_port
+
+          # Required for LINEAR deployment
+          advanced_configuration = {
+            alternate_target_group_arn = module.alb.target_groups["ex_ecs_alternate"].arn
+            production_listener_rule   = aws_lb_listener_rule.production.arn
+            test_listener_rule         = aws_lb_listener_rule.test.arn
+            role_arn                   = aws_iam_role.ecs_elb_permissions.arn
+          }
         }
       }
 
@@ -331,8 +340,11 @@ module "alb" {
       port     = 80
       protocol = "HTTP"
 
-      forward = {
-        target_group_key = "ex_ecs"
+      # Default action - rules are managed separately to allow ECS to control weights
+      fixed_response = {
+        content_type = "text/plain"
+        message_body = "404: Page not found"
+        status_code  = "404"
       }
     }
   }
@@ -361,9 +373,95 @@ module "alb" {
       # ECS will attach the IPs of the tasks to this target group
       create_attachment = false
     }
+
+    # Required for LINEAR deployment
+    ex_ecs_alternate = {
+      backend_protocol                  = "HTTP"
+      backend_port                      = local.container_port
+      target_type                       = "ip"
+      deregistration_delay              = 5
+      load_balancing_cross_zone_enabled = true
+
+      health_check = {
+        enabled             = true
+        healthy_threshold   = 5
+        interval            = 30
+        matcher             = "200"
+        path                = "/"
+        port                = "traffic-port"
+        protocol            = "HTTP"
+        timeout             = 5
+        unhealthy_threshold = 2
+      }
+
+      create_attachment = false
+    }
   }
 
   tags = local.tags
+}
+
+################################################################################
+# Listener Rules for LINEAR Deployment
+# Managed separately so ECS can control weights during deployments
+################################################################################
+
+resource "aws_lb_listener_rule" "production" {
+  listener_arn = module.alb.listeners["ex_http"].arn
+  priority     = 1
+
+  action {
+    type = "forward"
+    forward {
+      target_group {
+        arn    = module.alb.target_groups["ex_ecs"].arn
+        weight = 100
+      }
+      target_group {
+        arn    = module.alb.target_groups["ex_ecs_alternate"].arn
+        weight = 0
+      }
+    }
+  }
+
+  condition {
+    path_pattern {
+      values = ["/*"]
+    }
+  }
+
+  tags = local.tags
+
+  lifecycle {
+    ignore_changes = [action]
+  }
+}
+
+resource "aws_lb_listener_rule" "test" {
+  listener_arn = module.alb.listeners["ex_http"].arn
+  priority     = 2
+
+  action {
+    type = "forward"
+    forward {
+      target_group {
+        arn    = module.alb.target_groups["ex_ecs_alternate"].arn
+        weight = 100
+      }
+    }
+  }
+
+  condition {
+    path_pattern {
+      values = ["/*"]
+    }
+  }
+
+  tags = local.tags
+
+  lifecycle {
+    ignore_changes = [action]
+  }
 }
 
 module "autoscaling" {
@@ -426,9 +524,16 @@ module "autoscaling_sg" {
     {
       rule                     = "http-80-tcp"
       source_security_group_id = module.alb.security_group_id
+    },
+    {
+      from_port                = local.container_port
+      to_port                  = local.container_port
+      protocol                 = "tcp"
+      description              = "Container port from ALB"
+      source_security_group_id = module.alb.security_group_id
     }
   ]
-  number_of_computed_ingress_with_source_security_group_id = 1
+  number_of_computed_ingress_with_source_security_group_id = 2
 
   egress_rules = ["all-all"]
 
@@ -450,4 +555,39 @@ module "vpc" {
   single_nat_gateway = true
 
   tags = local.tags
+}
+
+################################################################################
+# IAM Role for ECS ELB Permissions (required for LINEAR deployment)
+################################################################################
+
+resource "aws_iam_role" "ecs_elb_permissions" {
+  name = "${local.name}-ecs-elb-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = [
+            "ecs-tasks.amazonaws.com",
+            "ecs.amazonaws.com",
+          ]
+        }
+      }
+    ]
+  })
+
+  tags = local.tags
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_service_role" {
+  role       = aws_iam_role.ecs_elb_permissions.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceRole"
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_elb_management_role" {
+  role       = aws_iam_role.ecs_elb_permissions.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonECSInfrastructureRolePolicyForLoadBalancers"
 }
